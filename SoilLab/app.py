@@ -895,8 +895,9 @@ def render_gradation_section(results, params=None, extra_curve=None,
     with st.expander("⚙ Graph options"):
         o1, o2, o3 = st.columns(3)
         coarse_left = o1.checkbox(
-            "Coarse → fine (left to right)", value=True, key=f"{key}_coarse_left",
-            help="Standard gradation-chart layout: gravel on the left, fines on the right.",
+            "Reverse axis (large → small)", value=False, key=f"{key}_coarse_left",
+            help="Off (default): particle size increases left to right (0.01 → 0.1 → 1 → 10 mm). "
+                 "On: classic soil-chart layout with the largest sizes on the left.",
         )
         smooth = o2.checkbox("Smooth curve", value=True, key=f"{key}_smooth")
         bands = o3.checkbox("Soil-size bands", value=True, key=f"{key}_bands")
@@ -917,7 +918,7 @@ def render_gradation_section(results, params=None, extra_curve=None,
             return
 
         note(
-            "Interactive Desmos version of the same curve (log x-axis, fine → coarse). "
+            "Interactive Desmos version of the same curve (log x-axis, increasing left to right). "
             "You can zoom, trace points and edit expressions. Needs an internet connection."
         )
         b1, b2 = st.columns([3, 2])
