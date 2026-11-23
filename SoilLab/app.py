@@ -1,8 +1,11 @@
+import json
+import html
+
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
-import json
-import streamlit.components.v1 as components
+import plotly.graph_objects as go
 from io import BytesIO
 
 from soil_lab.calculations import (
@@ -410,15 +413,6 @@ with st.sidebar:
         st.session_state["appearance"] = appearance_choice
         st.rerun()
     st.caption("Theme is kept for this session.")
-    st.divider()
-    st.markdown("### Desmos Graph")
-    st.text_input(
-        "Desmos API key",
-        type="password",
-        key="desmos_api_key",
-        help="A Desmos Graphing Calculator API key is required to render interactive graphs.",
-    )
-    st.caption("Add your Desmos API key to enable the interactive grading curve.")
 
 SAMPLE_DATA = pd.DataFrame({
     "sieve_mm": [4.75, 2.00, 0.425, 0.250, 0.150, 0.075, 0.0],
@@ -508,182 +502,454 @@ def collect_sieve_data():
         return None, total_mass
 
 
-def draw_gradation_curve(results, extra_curve=None, title="Grain-Size Distribution Curve"):
-    """
-    Render a semi-logarithmic grain-size distribution curve with Desmos.
-    The horizontal coordinate is log10(particle size in mm).
-    """
-    t = theme
-    st.markdown(f"**{title}**")
-    formation = results.loc[
-        (results["sieve_mm"] > 0) & results["percent_passing"].notna(),
-        ["sieve_mm", "percent_passing"],
-    ].copy()
+# ------------------------------------------------------------
+# GRADATION-CURVE HELPERS
+# ------------------------------------------------------------
+# Soil-size bands (USCS sieve boundaries, mm)
+SIZE_BANDS = [
+    (0.0, 0.075, "Fines"),
+    (0.075, 0.425, "Fine sand"),
+    (0.425, 2.0, "Medium sand"),
+    (2.0, 4.75, "Coarse sand"),
+    (4.75, 1e6, "Gravel"),
+]
 
-    if formation.empty:
+DESMOS_API_URL = (
+    "https://www.desmos.com/api/v1.9/calculator.js"
+    "?apiKey=dcb31709b452b1cf9dc26972add0fda6"  # Desmos public demo key
+)
+
+
+def curve_points(results):
+    """Measured (sieve size, % passing) points, sorted fine -> coarse, monotone."""
+    df = results.loc[results["sieve_mm"] > 0, ["sieve_mm", "percent_passing"]].dropna()
+    df = (
+        df.groupby("sieve_mm", as_index=False)["percent_passing"].max()
+        .sort_values("sieve_mm")
+    )
+    sizes = df["sieve_mm"].to_numpy(dtype=float)
+    passing = np.clip(df["percent_passing"].to_numpy(dtype=float), 0, 100)
+    passing = np.maximum.accumulate(passing)
+    return sizes, passing
+
+
+def smooth_curve(sizes, passing, n=240):
+    """Monotone cubic (PCHIP) interpolation in log10(size).
+
+    Gives the smooth S-shaped curve of a real gradation chart without
+    overshooting or dipping between the measured points.
+    """
+    sizes = np.asarray(sizes, dtype=float)
+    passing = np.asarray(passing, dtype=float)
+    if len(sizes) < 3:
+        return sizes, passing
+
+    x = np.log10(sizes)
+    y = passing
+    h = np.diff(x)
+    d = np.diff(y) / h
+    m = np.zeros_like(y)
+
+    for k in range(1, len(x) - 1):
+        if d[k - 1] * d[k] > 0:
+            w1 = 2 * h[k] + h[k - 1]
+            w2 = h[k] + 2 * h[k - 1]
+            m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k])
+
+    def end_slope(h0, h1, d0, d1):
+        v = ((2 * h0 + h1) * d0 - h0 * d1) / (h0 + h1)
+        if np.sign(v) != np.sign(d0):
+            return 0.0
+        if np.sign(d0) != np.sign(d1) and abs(v) > 3 * abs(d0):
+            return 3 * d0
+        return v
+
+    m[0] = end_slope(h[0], h[1], d[0], d[1])
+    m[-1] = end_slope(h[-1], h[-2], d[-1], d[-2])
+
+    xs = np.linspace(x[0], x[-1], n)
+    idx = np.clip(np.searchsorted(x, xs, side="right") - 1, 0, len(x) - 2)
+    t = (xs - x[idx]) / h[idx]
+    h00 = 2 * t**3 - 3 * t**2 + 1
+    h10 = t**3 - 2 * t**2 + t
+    h01 = -2 * t**3 + 3 * t**2
+    h11 = t**3 - t**2
+    ys = (
+        h00 * y[idx]
+        + h10 * h[idx] * m[idx]
+        + h01 * y[idx + 1]
+        + h11 * h[idx] * m[idx + 1]
+    )
+    return 10**xs, np.clip(ys, 0, 100)
+
+
+def _thin(df, max_rows=200):
+    if len(df) <= max_rows:
+        return df
+    idx = np.linspace(0, len(df) - 1, max_rows).round().astype(int)
+    return df.iloc[idx]
+
+
+# ------------------------------------------------------------
+# LOCAL (PLOTLY) GRAPH
+# ------------------------------------------------------------
+def draw_gradation_curve(
+    results,
+    extra_curve=None,
+    title="Grain-Size Distribution Curve",
+    params=None,
+    coarse_left=True,
+    smooth=True,
+    show_bands=True,
+    key="gradation",
+):
+    t = theme
+    sizes, passing = curve_points(results)
+
+    if len(sizes) == 0:
         st.warning("No positive sieve openings are available for the graph.")
         return
 
-    # Sort ascending and combine duplicate sieve openings before plotting.
-    formation = (
-        formation.groupby("sieve_mm", as_index=False)["percent_passing"]
-        .mean()
-        .sort_values("sieve_mm")
-    )
-    formation["log_size"] = np.log10(formation["sieve_mm"].astype(float))
-    formation["percent_passing"] = formation["percent_passing"].clip(0, 100)
-    aquifer_x = formation["log_size"].astype(float).tolist()
-    aquifer_y = formation["percent_passing"].astype(float).tolist()
-
-    pack_x, pack_y = [], []
+    min_size, max_size = float(sizes.min()), float(sizes.max())
     if extra_curve is not None:
-        pack = extra_curve.loc[
-            (extra_curve["particle_size_mm"] > 0) & extra_curve["percent_passing"].notna(),
-            ["particle_size_mm", "percent_passing"],
-        ].copy()
-        if not pack.empty:
-            pack = (
-                pack.groupby("particle_size_mm", as_index=False)["percent_passing"]
-                .mean()
-                .sort_values("particle_size_mm")
-            )
-            pack_x = np.log10(pack["particle_size_mm"].astype(float)).tolist()
-            pack_y = pack["percent_passing"].clip(0, 100).astype(float).tolist()
+        min_size = min(min_size, float(extra_curve["particle_size_mm"].min()))
+        max_size = max(max_size, float(extra_curve["particle_size_mm"].max()))
 
-    all_x = aquifer_x + pack_x
-    x_min, x_max = min(all_x), max(all_x)
-    if np.isclose(x_min, x_max):
-        x_min, x_max = x_min - 0.5, x_max + 0.5
+    log_min = np.floor(np.log10(max(min_size, 1e-6)))
+    log_max = np.ceil(np.log10(max_size))
+    if log_min == log_max:
+        log_min -= 1
+        log_max += 1
+    x_lo, x_hi = 10**log_min, 10**log_max
+
+    fig = go.Figure()
+
+    # --- soil-size bands -------------------------------------------------
+    if show_bands:
+        for i, (b0, b1, label) in enumerate(SIZE_BANDS):
+            lo, hi = max(b0, x_lo), min(b1, x_hi)
+            if hi <= lo:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[lo, hi, hi, lo, lo],
+                y=[0, 0, 100, 100, 0],
+                mode="lines",
+                fill="toself",
+                line=dict(width=0),
+                fillcolor="rgba(120,150,170,0.07)" if i % 2 == 0 else "rgba(120,150,170,0.16)",
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+            if np.log10(hi) - np.log10(lo) >= 0.3:
+                fig.add_trace(go.Scatter(
+                    x=[np.sqrt(lo * hi)],
+                    y=[97.5],
+                    mode="text",
+                    text=[label],
+                    textfont=dict(size=12, color=t["muted"]),
+                    hoverinfo="skip",
+                    showlegend=False,
+                ))
+
+    # --- aquifer curve ---------------------------------------------------
+    if smooth and len(sizes) >= 3:
+        cx, cy = smooth_curve(sizes, passing)
     else:
-        x_min, x_max = x_min - 0.25, x_max + 0.25
+        cx, cy = sizes, passing
 
-    api_key = st.session_state.get("desmos_api_key", "").strip()
-    if not api_key:
-        st.warning(
-            "Enter a Desmos API key in the left sidebar under **Desmos Graph** "
-            "to display the interactive grading curve."
-        )
-        st.markdown("[Get a Desmos Graphing Calculator API key](https://www.desmos.com/my-api)")
-        st.caption(
-            "The horizontal coordinate is log₁₀(D in mm), equivalent to a logarithmic "
-            "particle-size axis; the vertical axis is percentage passing."
-        )
-        return
+    fig.add_trace(go.Scatter(
+        x=cx, y=cy,
+        mode="lines",
+        name="Aquifer formation",
+        line=dict(color=t["aquifer"], width=3.5, shape="linear"),
+        hovertemplate="Particle size: %{x:.4g} mm<br>Passing: %{y:.2f}%<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=sizes, y=passing,
+        mode="markers",
+        name="Sieve data",
+        marker=dict(size=9, color=t["aquifer"], line=dict(width=2, color=t["plot_bg"])),
+        hovertemplate="Sieve: %{x:.4g} mm<br>Passing: %{y:.2f}%<extra></extra>",
+    ))
 
-    expressions = [{
-        "id": "aquifer_curve",
-        "type": "table",
-        "columns": [
-            {"latex": "x_1", "values": aquifer_x},
-            {"latex": "y_1", "values": aquifer_y},
-        ],
-        "color": t["aquifer"],
-        "lines": True,
-        "points": True,
-        "lineWidth": 3,
-        "pointSize": 8,
-        "dragMode": "NONE",
-    }]
+    # --- proposed filter pack -------------------------------------------
+    if extra_curve is not None:
+        fig.add_trace(go.Scatter(
+            x=extra_curve["particle_size_mm"],
+            y=extra_curve["percent_passing"],
+            mode="lines",
+            name="Proposed filter pack",
+            line=dict(color=t["pack"], width=3.5, dash="dash"),
+            hovertemplate="Particle size: %{x:.4g} mm<br>Passing: %{y:.2f}%<extra></extra>",
+        ))
 
-    if pack_x:
-        expressions.append({
-            "id": "filter_pack_curve",
-            "type": "table",
-            "columns": [
-                {"latex": "x_2", "values": pack_x},
-                {"latex": "y_2", "values": pack_y},
-            ],
-            "color": t["pack"],
-            "lines": True,
-            "points": True,
-            "lineStyle": "DASHED",
-            "lineWidth": 3,
-            "pointSize": 6,
-            "dragMode": "NONE",
-        })
+    # --- characteristic D sizes with drop lines -------------------------
+    if params:
+        label_pos = "top left" if coarse_left is False else "top right"
+        # curve rises toward the right on a normal axis (fine -> coarse),
+        # and toward the left when the axis is reversed (coarse -> fine).
+        label_pos = "top left" if not coarse_left else "top right"
+        for name, pct in [("D10", 10), ("D30", 30), ("D40", 40), ("D60", 60), ("D70", 70)]:
+            val = params.get(name)
+            if val is None or not (x_lo <= val <= x_hi):
+                continue
+            fig.add_trace(go.Scatter(
+                x=[val, val], y=[0, pct],
+                mode="lines",
+                line=dict(color=t["muted"], width=1, dash="dot"),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+            fig.add_trace(go.Scatter(
+                x=[val], y=[pct],
+                mode="markers+text",
+                text=[f"{name} = {val:.3g} mm"],
+                textposition=label_pos,
+                textfont=dict(size=12, color=t["plot_font"]),
+                marker=dict(size=10, symbol="diamond", color=t["pack"],
+                            line=dict(width=1.5, color=t["plot_bg"])),
+                hovertemplate=f"{name}: %{{x:.4g}} mm<extra></extra>",
+                showlegend=False,
+            ))
 
-    # Horizontal percentage guides and vertical guides at calculated D-values.
-    for pct in (10, 30, 40, 60, 70):
-        expressions.append({
-            "id": f"reference_{pct}",
-            "latex": f"y={pct}",
-            "color": t["muted"],
-            "lineStyle": "DASHED",
-            "lineWidth": 1,
-        })
-
-    try:
-        params = soil_parameters(results)
-        for key in ("D10", "D30", "D40", "D60", "D70"):
-            value = params.get(key)
-            if value is not None and np.isfinite(value) and value > 0:
-                expressions.append({
-                    "id": f"guide_{key}",
-                    "latex": f"x={np.log10(float(value)):.10f}",
-                    "color": t["muted"],
-                    "lineStyle": "DOTTED",
-                    "lineWidth": 1,
-                })
-    except (KeyError, TypeError, ValueError):
-        pass
-
-    html = f"""
-    <div id="soil-lab-desmos" style="width:100%; height:650px;"></div>
-    <script>
-      (function() {{
-        const apiKey = {json.dumps(api_key)};
-        const script = document.createElement("script");
-        script.src = "https://www.desmos.com/api/v1.11/calculator.js?apiKey="
-                     + encodeURIComponent(apiKey);
-        script.onload = function() {{
-          const calculator = Desmos.GraphingCalculator(
-            document.getElementById("soil-lab-desmos"), {{
-              expressions: true,
-              settingsMenu: true,
-              zoomButtons: true,
-              showResetButtonOnGraphpaper: true,
-              fontSize: 16,
-              backgroundColor: {json.dumps(t["plot_bg"])},
-              textColor: {json.dumps(t["plot_font"])},
-              gridColor: {json.dumps(t["grid_major"])},
-              xAxisLabel: "log₁₀ particle size, D (mm)",
-              yAxisLabel: "Percentage finer / passing (%)",
-              xAxisStep: 1,
-              yAxisStep: 10,
-              xAxisMinorSubdivisions: 9,
-              yAxisMinorSubdivisions: 1,
-              xAxisNumbers: true,
-              yAxisNumbers: true,
-              lockViewport: false
-            }}
-          );
-          const expressions = {json.dumps(expressions)};
-          expressions.forEach(function(expression) {{
-            calculator.setExpression(expression);
-          }});
-          calculator.setMathBounds({{
-            left: {float(x_min)},
-            right: {float(x_max)},
-            bottom: 0,
-            top: 100
-          }});
-        }};
-        script.onerror = function() {{
-          document.getElementById("soil-lab-desmos").innerHTML =
-            "<p style='font-family:Arial;padding:18px;color:#b00020'>"
-            + "Desmos could not be loaded. Check your internet connection and API key."
-            + "</p>";
-        }};
-        document.head.appendChild(script);
-      }})();
-    </script>
-    """
-    components.html(html, height=675, scrolling=False)
-    st.caption(
-        "Semi-logarithmic grading curve: log₁₀(D in mm) horizontally and percentage "
-        "passing vertically. Data are sorted by increasing particle size and joined "
-        "with straight segments; no artificial spline smoothing is applied."
+    font_color = t["plot_font"]
+    fig.update_layout(
+        title=dict(text=title, x=0.01, xanchor="left", font=dict(size=20)),
+        template="plotly_dark" if st.session_state["appearance"] == "Dark" else "plotly_white",
+        height=620,
+        hovermode="closest",
+        margin=dict(l=80, r=40, t=85, b=80),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=14)),
+        plot_bgcolor=t["plot_bg"],
+        paper_bgcolor=t["plot_bg"],
+        font=dict(family="Inter, Segoe UI, Arial, sans-serif", size=14, color=font_color),
     )
+    fig.update_xaxes(
+        title=dict(text="Particle size, D (mm)  —  log scale", font=dict(size=15)),
+        type="log",
+        range=[log_max, log_min] if coarse_left else [log_min, log_max],
+        dtick=1,
+        showline=True, linecolor=font_color, mirror=True,
+        showgrid=True, gridcolor=t["grid_major"],
+        minor=dict(showgrid=True, gridcolor=t["grid_minor"], dtick="D1", ticks="outside"),
+        ticks="outside", tickfont=dict(size=13),
+        zeroline=False,
+    )
+    fig.update_yaxes(
+        title=dict(text="Percentage finer / passing (%)", font=dict(size=15)),
+        range=[0, 100],
+        dtick=10,
+        ticksuffix="%",
+        showline=True, linecolor=font_color, mirror=True,
+        showgrid=True, gridcolor=t["grid_major"],
+        minor=dict(showgrid=True, gridcolor=t["grid_minor"], dtick=5),
+        ticks="outside", tickfont=dict(size=13),
+        zeroline=False,
+    )
+
+    st.plotly_chart(
+        fig, use_container_width=True, key=key,
+        config={"displaylogo": False, "toImageButtonOptions": {"format": "png", "scale": 3, "filename": "SoilLab_gradation_curve"}},
+    )
+    st.caption(
+        "Semi-logarithmic gradation chart: log particle-size axis (mm) and linear "
+        "percent-passing axis. The line is a smooth monotone fit through the measured "
+        "sieve points (dots). Use the camera icon on the graph to save a PNG."
+    )
+
+
+# ------------------------------------------------------------
+# DESMOS GRAPH
+# ------------------------------------------------------------
+def build_desmos_html(results, params=None, extra_curve=None, title="Grain-Size Distribution Curve"):
+    """Self-contained HTML page that draws the gradation curve in Desmos."""
+    t = THEMES["Light"]
+    sizes, passing = curve_points(results)
+    if len(sizes) == 0:
+        return None
+
+    def fmt(arr):
+        return [f"{float(v):.6g}" for v in arr]
+
+    cx, cy = smooth_curve(sizes, passing, 160)
+    exprs = [
+        {"id": "note1", "type": "text", "text": "Blue: aquifer gradation (smooth fit) and measured sieve points"},
+        {
+            "id": "curve", "type": "table",
+            "columns": [
+                {"latex": "x_1", "values": fmt(cx)},
+                {"latex": "y_1", "values": fmt(cy), "color": t["aquifer"],
+                 "points": False, "lines": True, "lineStyle": "SOLID", "lineWidth": "4"},
+            ],
+        },
+        {
+            "id": "sieves", "type": "table",
+            "columns": [
+                {"latex": "x_2", "values": fmt(sizes)},
+                {"latex": "y_2", "values": fmt(passing), "color": t["aquifer"],
+                 "points": True, "lines": False, "pointSize": "9"},
+            ],
+        },
+    ]
+
+    all_x = list(sizes)
+    if extra_curve is not None:
+        pack = _thin(extra_curve[["particle_size_mm", "percent_passing"]].dropna())
+        all_x += list(pack["particle_size_mm"])
+        exprs.append({"id": "note2", "type": "text", "text": "Orange dashed: proposed filter pack"})
+        exprs.append({
+            "id": "pack", "type": "table",
+            "columns": [
+                {"latex": "x_3", "values": fmt(pack["particle_size_mm"])},
+                {"latex": "y_3", "values": fmt(pack["percent_passing"]), "color": t["pack"],
+                 "points": False, "lines": True, "lineStyle": "DASHED", "lineWidth": "4"},
+            ],
+        })
+
+    if params:
+        for name, pct in [("D10", 10), ("D30", 30), ("D40", 40), ("D60", 60), ("D70", 70)]:
+            val = params.get(name)
+            if val is None:
+                continue
+            exprs.append({
+                "id": f"h_{name}", "latex": f"y={pct}",
+                "color": "#7A8B96", "lineStyle": "DOTTED", "lineWidth": "1",
+            })
+            exprs.append({
+                "id": f"v_{name}",
+                "latex": "x=" + f"{val:.6g}" + r"\left\{0\le y\le " + str(pct) + r"\right\}",
+                "color": "#7A8B96", "lineStyle": "DOTTED", "lineWidth": "1",
+            })
+            exprs.append({
+                "id": f"p_{name}", "latex": f"({val:.6g},{pct})",
+                "color": t["pack"], "pointStyle": "POINT", "pointSize": "10",
+                "showLabel": True, "label": f"{name} = {val:.3g} mm",
+            })
+
+    xmin, xmax = min(all_x), max(all_x)
+    cfg = {
+        "expressions": exprs,
+        "bounds": {"left": xmin / 3, "right": xmax * 3, "bottom": -5, "top": 105},
+        "xLabel": "Particle size, D (mm) - log scale",
+        "yLabel": "Percentage finer / passing (%)",
+    }
+    payload = json.dumps(cfg).replace("</", "<\\/")
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{html.escape(title)} - Desmos</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="{DESMOS_API_URL}"></script>
+<style>
+  html, body {{ margin:0; height:100%; font-family:Arial,sans-serif; }}
+  #calc {{ width:100%; height:100%; }}
+  #err {{ padding:2rem; color:#a8352f; }}
+</style></head>
+<body><div id="calc"></div>
+<script>
+const CFG = {payload};
+if (typeof Desmos === "undefined") {{
+  document.body.innerHTML = '<div id="err"><b>Desmos could not be loaded.</b><br>Check your internet connection and try again.</div>';
+}} else {{
+  const calc = Desmos.GraphingCalculator(document.getElementById("calc"),
+    {{ expressions: true, settingsMenu: true, zoomButtons: true, keypad: false }});
+  try {{
+    calc.updateSettings({{
+      xAxisScale: "logarithmic",
+      xAxisLabel: CFG.xLabel, yAxisLabel: CFG.yLabel,
+      yAxisStep: 10, yAxisMinorSubdivisions: 2,
+      showGrid: true
+    }});
+  }} catch (e) {{ console.warn("Axis settings not applied", e); }}
+  calc.setExpressions(CFG.expressions);
+  try {{ calc.setMathBounds(CFG.bounds); }} catch (e) {{}}
+}}
+</script></body></html>"""
+
+
+def desmos_open_button(page_html):
+    """Button that opens the Desmos page in a new browser tab."""
+    t = theme
+    payload = json.dumps(page_html).replace("</", "<\\/")
+    components.html(
+        f"""
+        <button id="b" style="width:100%;height:46px;border:none;border-radius:10px;
+            background:{t['primary']};color:{t['on_primary']};font-size:16px;font-weight:600;
+            font-family:Inter,Arial,sans-serif;cursor:pointer;">
+            ↗ Open Desmos graph in a new tab
+        </button>
+        <script>
+        const PAGE = {payload};
+        document.getElementById("b").onclick = function () {{
+            const blob = new Blob([PAGE], {{type: "text/html"}});
+            const w = window.open(URL.createObjectURL(blob), "_blank");
+            if (!w) alert("Your browser blocked the pop-up. Please allow pop-ups for this site, or use the download button.");
+        }};
+        </script>
+        """,
+        height=56,
+    )
+
+
+def render_gradation_section(results, params=None, extra_curve=None,
+                             title="Grain-Size Distribution Curve", key="main"):
+    with st.expander("⚙ Graph options"):
+        o1, o2, o3 = st.columns(3)
+        coarse_left = o1.checkbox(
+            "Coarse → fine (left to right)", value=True, key=f"{key}_coarse_left",
+            help="Standard gradation-chart layout: gravel on the left, fines on the right.",
+        )
+        smooth = o2.checkbox("Smooth curve", value=True, key=f"{key}_smooth")
+        bands = o3.checkbox("Soil-size bands", value=True, key=f"{key}_bands")
+
+    tab_local, tab_desmos = st.tabs(["📈 Local graph", "🧮 Desmos graph"])
+
+    with tab_local:
+        draw_gradation_curve(
+            results, extra_curve, title, params,
+            coarse_left=coarse_left, smooth=smooth, show_bands=bands,
+            key=f"{key}_plot",
+        )
+
+    with tab_desmos:
+        page = build_desmos_html(results, params, extra_curve, title)
+        if page is None:
+            st.warning("No positive sieve openings are available for Desmos.")
+            return
+
+        note(
+            "Interactive Desmos version of the same curve (log x-axis, fine → coarse). "
+            "You can zoom, trace points and edit expressions. Needs an internet connection."
+        )
+        b1, b2 = st.columns([3, 2])
+        with b1:
+            desmos_open_button(page)
+        with b2:
+            st.download_button(
+                "⬇ Download as HTML",
+                data=page.encode("utf-8"),
+                file_name="SoilLab_gradation_desmos.html",
+                mime="text/html",
+                use_container_width=True,
+                key=f"{key}_desmos_dl",
+            )
+        components.html(page, height=640, scrolling=False)
+
+        with st.expander("Copy the data into desmos.com/calculator manually"):
+            sizes, passing = curve_points(results)
+            cx, cy = smooth_curve(sizes, passing, 60)
+            text = "particle_size_mm\tpercent_passing\n" + "\n".join(
+                f"{a:.5g}\t{b:.3f}" for a, b in zip(cx, cy)
+            )
+            st.caption(
+                "Paste this into a Desmos table, then in the graph settings (wrench icon) "
+                "set the x-axis to logarithmic."
+            )
+            st.code(text, language="text")
+            st.markdown(
+                '<a href="https://www.desmos.com/calculator" target="_blank" rel="noopener">'
+                "Open desmos.com/calculator ↗</a>",
+                unsafe_allow_html=True,
+            )
 
 
 def get_current_results():
@@ -865,7 +1131,7 @@ elif page == "Sieve Analysis":
         p2.metric("Coefficient of curvature (Cc)", fmt_num(params["Cc"]))
 
         st.subheader("5 · Semi-logarithmic gradation curve")
-        draw_gradation_curve(results)
+        render_gradation_section(results, params, title="Grain-Size Distribution Curve", key="sieve")
 
         st.subheader("6 · Download reports")
         excel_data = build_excel_report(results, params, recovery)
@@ -1029,7 +1295,7 @@ elif page == "Filter-Pack Design":
                 )
 
                 st.subheader("Gradation curves")
-                draw_gradation_curve(results, pack_curve, "Aquifer and Proposed Filter-Pack Gradation")
+                render_gradation_section(results, params, pack_curve, "Aquifer and Proposed Filter-Pack Gradation", key="pack")
 
                 st.subheader("Proposed filter-pack data")
                 st.dataframe(
@@ -1071,18 +1337,6 @@ elif page == "Settings & Help":
         st.session_state["appearance"] = selected_theme
         st.rerun()
     st.caption("The selected theme applies to the interface and gradation graph for this session.")
-
-    st.divider()
-    st.subheader("Desmos graph setup")
-    st.markdown("""
-    1. Obtain a Desmos Graphing Calculator API key from [Desmos API](https://www.desmos.com/my-api).
-    2. Enter the key in the **Desmos Graph** section of the left sidebar.
-    3. Open **Sieve Analysis** or **Filter-Pack Design** to view the interactive grading curve.
-
-    The graph plots log₁₀(particle size in mm) horizontally and percentage passing vertically.
-    This is the standard semi-logarithmic grading-curve arrangement. The measured points are
-    connected in ascending particle-size order without spline smoothing.
-    """)
 
     st.divider()
     st.subheader("How to use SoilLab")
